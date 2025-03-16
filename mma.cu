@@ -28,7 +28,7 @@ __global__ void simpleGemmWOCuTe(const double *A, const double *B, double *C, in
     /*
         A, B, C are column-major matrices
         A: (m, k):(1, m)
-        B: (k, n):(1, n)
+        B: (k, n):(1, k)
         C: (m, n):(1, m)
     */
     // sanity check
@@ -42,7 +42,8 @@ __global__ void simpleGemmWOCuTe(const double *A, const double *B, double *C, in
     static_assert(BN % 4 == 0);
 
     int warpId = threadIdx.x / 32;
-    int warp_i = warpId % WARP_REP_N, warp_j = warpId / WARP_REP_N;
+    int warp_i = warpId % WARP_REP_M;
+    int warp_j = warpId / WARP_REP_M;
     int lane_id = threadIdx.x % 32;
 
     double c0_acc, c1_acc;
@@ -56,14 +57,14 @@ __global__ void simpleGemmWOCuTe(const double *A, const double *B, double *C, in
             int a_col = lane_id % 4;
             // A is 8 x 4 per warp
             a0 = // A[blockIdx.x * BM + warp_i * 8 + a_row , blk_k * BK + warp_k * 4 + warp_j * 4 + a_col]
-                *(A + blockIdx.x * BM + warp_i * 8 + a_row + (blk_k * BK + warp_k * 4 + warp_j * 4 + a_col) * m);
+                *(A + blockIdx.x * BM + warp_i * 8 + a_row + (blk_k * BK + warp_k * 4 + a_col) * m);
 
             // from nvidia official guide
             int b_row = lane_id % 4;
             int b_col = lane_id / 4;
             // B is 4 x 8 per warp
             b0 = // B[blk_k * BK + warp_k * 4 + warp_i * 4 + b_row, blockIdx.y * BN + warp_j * 8 + b_col]
-                *(B + blk_k * BK + warp_k * 4 + warp_i * 4 + b_row + (blockIdx.y * BN + warp_j * 8 + b_col) * k);
+                *(B + blk_k * BK + warp_k * 4 + b_row + (blockIdx.y * BN + warp_j * 8 + b_col) * k);
 
             // wait for warp to load value to register and mma
             cute::SM80_8x8x4_F64F64F64F64_TN::fma(d0, d1, a0, b0, 0, 0);
@@ -127,7 +128,7 @@ int main(int argc, char const *argv[])
     int m = 2048;
     int n = 2048;
     int k = 2048;
-    // parse args m n k
+     // parse args m n k if provided
     if (argc == 4) {
         m = std::atoi(argv[1]);
         n = std::atoi(argv[2]);
@@ -149,9 +150,9 @@ int main(int argc, char const *argv[])
     cudaMemcpy(dA, A, m * k * sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpy(dB, B, k * n * sizeof(double), cudaMemcpyHostToDevice);
 
-    constexpr int BK = 4;
-    constexpr int WARP_REP_M = 1;
-    constexpr int WARP_REP_N = 1;
+    constexpr int BK = 16;
+    constexpr int WARP_REP_M = 4;
+    constexpr int WARP_REP_N = 4;
     constexpr int BM = WARP_REP_M * 8;
     constexpr int BN = WARP_REP_N * 8;
 
@@ -162,6 +163,11 @@ int main(int argc, char const *argv[])
     printf("CUDA error: %s\n", cudaGetErrorString(err));
 
     cudaMemcpy(C, dC, m * n * sizeof(double), cudaMemcpyDeviceToHost);
+
+    // printMatrix(A, m, k);
+    // printMatrix(B, k, n);
+    // printMatrix(C, m, n);
+    // printMatrix(C_ref, m, n);
 
     assertEqual(C, C_ref, m * n);
     printf("CUDA GEMM passed\n");
