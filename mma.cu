@@ -1,30 +1,31 @@
 // nvcc -arch=sm_80 -I${CUTLASS_REPO_PATH}/include mma.cu && ./a.out && rm a.out
-
 #include <cstdlib>
 #include <stdio.h>
 #include <iostream>
 
-#include <cuda_bf16.h>
-
+#include "cute/tensor.hpp"
 #include "cute/arch/mma_sm80.hpp"
 #include "utils.cuh"
 
-__global__ void gemmKernel(double *A, double *B, double *C, int M, int N, int K) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;  // Row index of C
-    int col = blockIdx.x * blockDim.x + threadIdx.x;  // Column index of C
+__global__ void trivialGemm(double *A, double *B, double *C, int M, int N, int K) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x; 
+    int j = blockIdx.y * blockDim.y + threadIdx.y; 
 
-    if (row < M && col < N) {
+    if (i < M && j < N) {
         double sum = 0.0f;
         for (int k = 0; k < K; k++) {
-            sum += A[row * K + k] * B[k * N + col];
+            sum += A[i + k * M] * B[k + j * K];
         }
-        C[row * N + col] = sum;  // Store result in C
+        C[i + j * M] = sum;  // Store result in C
     }
 }
 
+constexpr int BM = 16;
+constexpr int BN = 16;
+constexpr int BK = 8;
 
-template <int BM, int BN, int BK, int WARP_REP_M, int WARP_REP_N>
-__global__ void simpleGemmWOCuTe(const double *A, const double *B, double *C, int m, int n, int k) {
+template <int BM, int BN, int BK>
+__global__ void trivialMMAWithoutCuTe(const double *A, const double *B, double *C, int m, int n, int k) {
     /*
         A, B, C are column-major matrices
         A: (m, k):(1, m)
@@ -35,11 +36,13 @@ __global__ void simpleGemmWOCuTe(const double *A, const double *B, double *C, in
     assert(m % BM == 0);
     assert(n % BN == 0);
     assert(k % BK == 0);
-    static_assert(WARP_REP_M * 8 == BM);
-    static_assert(WARP_REP_N * 8 == BN);
     static_assert(BM % 8 == 0);
     static_assert(BK % 4 == 0);
     static_assert(BN % 4 == 0);
+
+    constexpr int WARP_REP_M = BM / 8;
+    // constexpr int WARP_REP_N = BN / 8;
+    constexpr int WARP_SLICE_K = BK / 4;
 
     int warpId = threadIdx.x / 32;
     int warp_i = warpId % WARP_REP_M;
@@ -51,7 +54,7 @@ __global__ void simpleGemmWOCuTe(const double *A, const double *B, double *C, in
     for (int blk_k = 0; blk_k < k / BK; blk_k++) {
         double a0, b0, d0, d1;
         #pragma unroll
-        for (int warp_k = 0; warp_k < BK / 4; warp_k++) {  // each tensor core takes k = 4
+        for (int warp_k = 0; warp_k < WARP_SLICE_K; warp_k++) {  // each tensor core takes k = 4
             // from nvidia official guide
             int a_row = lane_id / 4;
             int a_col = lane_id % 4;
@@ -90,6 +93,75 @@ __global__ void simpleGemmWOCuTe(const double *A, const double *B, double *C, in
     // save result
     *pC0 = c0_acc; //c0_acc;
     *pC1 = c1_acc; //c1_acc;
+}
+
+
+template <int BM, int BN, int BK>
+__global__ void trivialMMAWithCuTe(const double *pA, const double *pB, double *pC, int m, int n, int k) {
+    /*
+        A, B, C are column-major matrices
+        A: (m, k):(1, m)
+        B: (k, n):(1, k)
+        C: (m, n):(1, m)
+    */
+    assert(m % BM == 0);
+    assert(n % BN == 0);
+    assert(k % BK == 0);
+    static_assert(BM % 8 == 0);
+    static_assert(BK % 4 == 0);
+    static_assert(BN % 4 == 0);
+
+    constexpr int WARP_REP_M = BM / 8;
+    // constexpr int WARP_REP_N = BN / 8;
+    constexpr int WARP_SLICE_K = BK / 4;
+
+    using namespace cute;
+    Tensor A = make_tensor(pA, make_shape(m, k), make_stride(1, m));
+    Tensor B = make_tensor(pB, make_shape(k, n), make_stride(1, k));
+    Tensor C = make_tensor(pC, make_shape(m, n), make_stride(1, m));
+
+    // tile abc and get cooresponding subtensor
+    Tensor gA = zipped_divide(A, make_shape(BM, BK))(_, make_coord(blockIdx.x, _)); // (m, k) -> ((BM, BK), (m / BM, k / BK)) -> ((BM, BK), k / BK)
+    Tensor gB = zipped_divide(B, make_shape(BK, BN))(_, make_coord(_, blockIdx.y));
+    Tensor gC = zipped_divide(C, make_shape(BM, BN))(make_coord(_, _), make_coord(blockIdx.x, blockIdx.y));
+
+    int warpId = threadIdx.x / 32;
+    int warp_i = warpId % WARP_REP_M;
+    int warp_j = warpId / WARP_REP_M;
+    int lane_id = threadIdx.x % 32;
+
+    double c0_acc, c1_acc;
+    c0_acc = c1_acc = 0;
+    for (int blk_k = 0; blk_k < k / BK; blk_k++) {
+        double a0, b0, d0, d1;
+        Tensor blkA = gA(make_coord(_, _), blk_k); // ((BM, BK), k / BK) -> (BM, BK)
+        Tensor blkB = gB(make_coord(_, _), blk_k);
+        Tensor blkA_sliced_k = zipped_divide(blkA, Shape<_8, _4>{});  // (BM, BK) -> ((8, 4), (WARP_REP_M, WARP_SLICE_K))
+        Tensor blkB_sliced_k = zipped_divide(blkB, Shape<_4, _8>{});  // (BK, BN) -> ((4, 8), (WARP_SLICE_K, WARP_REP_N))
+        #pragma unroll
+        for (int warp_k = 0; warp_k < WARP_SLICE_K; warp_k++) {
+            auto ALayout = MMA_Traits<SM80_8x8x4_F64F64F64F64_TN>::ALayout{};
+            Tensor warp_a = blkA_sliced_k(make_coord(_, _), make_coord(warp_i, warp_k));  // ((8, 4), (WARP_REP_M, WARP_SLICE_K)) -> (8, 4)
+            a0 = warp_a(ALayout(lane_id, 0));
+
+            // Note: B is (n, k) in CuTe, but (k, n) in this code
+            auto BLayout = MMA_Traits<SM80_8x8x4_F64F64F64F64_TN>::BLayout{};
+            Tensor warp_b = blkB_sliced_k(make_coord(_, _), make_coord(warp_k, warp_j));
+            int b_nk = BLayout(lane_id, 0);
+            int b_i = b_nk / 8, b_j = b_nk % 8;
+            b0 = warp_b(b_i, b_j);
+
+            cute::SM80_8x8x4_F64F64F64F64_TN::fma(d0, d1, a0, b0, 0, 0);
+
+            c0_acc += d0;
+            c1_acc += d1;
+        }
+    }
+    Tensor warp_c = zipped_divide(gC, Shape<_8, _8>{})(make_coord(_, _), make_coord(warp_i, warp_j)); // ((BM, BN), (WARP_REP_M, WARP_REP_N)) -> ((8, 8), (WARP_REP_M, WARP_REP_N))
+    auto CLayout = MMA_Traits<SM80_8x8x4_F64F64F64F64_TN>::CLayout{};
+
+    warp_c(CLayout(lane_id, 0)) = c0_acc;
+    warp_c(CLayout(lane_id, 1)) = c1_acc;
 }
 
 void refGemm(double *A, double *B, double *C, int m, int n, int k) {
@@ -150,27 +222,56 @@ int main(int argc, char const *argv[])
     cudaMemcpy(dA, A, m * k * sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpy(dB, B, k * n * sizeof(double), cudaMemcpyHostToDevice);
 
-    constexpr int BK = 16;
-    constexpr int WARP_REP_M = 4;
-    constexpr int WARP_REP_N = 4;
-    constexpr int BM = WARP_REP_M * 8;
-    constexpr int BN = WARP_REP_N * 8;
+    {
+        // test trivialGemm
+        randn(C, m * n, 0, 100);
+        dim3 threads(16, 16);
+        dim3 blocks(m / 16, n / 16);
+        time_t start, end;
+        start = clock();
+        trivialGemm<<<blocks, threads>>>(dA, dB, dC, m, n, k);
+        cudaError_t err = cudaDeviceSynchronize();
+        end = clock();
+        printf("CUDA error: %s\n", cudaGetErrorString(err));
+        printf("Runtime of trivialGemm: %f\n", (double)(end - start) / CLOCKS_PER_SEC);
+        cudaMemcpy(C, dC, m * n * sizeof(double), cudaMemcpyDeviceToHost);
+        assertEqual(C, C_ref, m * n);
+        printf("trivialGemm passed\n");
+    }
 
-    dim3 threads(32 * WARP_REP_M * WARP_REP_N);
-    dim3 blocks(m / BM, n / BN);
-    simpleGemmWOCuTe<BM, BN, BK, WARP_REP_M, WARP_REP_N><<<blocks, threads>>>(dA, dB, dC, m, n, k);
-    cudaError_t err = cudaDeviceSynchronize();
-    printf("CUDA error: %s\n", cudaGetErrorString(err));
+    {
+        // test trivialMMAWithoutCuTe
+        randn(C, m * n, 0, 100);
+        dim3 threads(BM * BN / 2);
+        dim3 blocks(m / BM, n / BN);
+        time_t start, end;
+        start = clock();
+        trivialMMAWithoutCuTe<BM, BN, BK><<<blocks, threads>>>(dA, dB, dC, m, n, k);
+        cudaError_t err = cudaDeviceSynchronize();
+        printf("CUDA error: %s\n", cudaGetErrorString(err));
+        end = clock();
+        printf("Runtime of trivialMMAWithoutCuTe: %f\n", (double)(end - start) / CLOCKS_PER_SEC);
+        cudaMemcpy(C, dC, m * n * sizeof(double), cudaMemcpyDeviceToHost);
+        assertEqual(C, C_ref, m * n);
+        printf("trivialMMAWithoutCuTe passed\n");
+    }
 
-    cudaMemcpy(C, dC, m * n * sizeof(double), cudaMemcpyDeviceToHost);
-
-    // printMatrix(A, m, k);
-    // printMatrix(B, k, n);
-    // printMatrix(C, m, n);
-    // printMatrix(C_ref, m, n);
-
-    assertEqual(C, C_ref, m * n);
-    printf("CUDA GEMM passed\n");
+    {
+        // test trivialMMAWithCuTe
+        randn(C, m * n, 0, 100);
+        dim3 threads(BM * BN / 2);
+        dim3 blocks(m / BM, n / BN);
+        time_t start, end;
+        start = clock();
+        trivialMMAWithCuTe<BM, BN, BK><<<blocks, threads>>>(dA, dB, dC, m, n, k);
+        cudaError_t err = cudaDeviceSynchronize();
+        end = clock();
+        printf("CUDA error: %s\n", cudaGetErrorString(err));
+        printf("Runtime of trivialMMAWithCuTe: %f\n", (double)(end - start) / CLOCKS_PER_SEC);
+        cudaMemcpy(C, dC, m * n * sizeof(double), cudaMemcpyDeviceToHost);
+        assertEqual(C, C_ref, m * n);
+        printf("trivialMMAWithCuTe passed\n");
+    }
 
     cudaFree(dA);
     cudaFree(dB);
