@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <iostream>
 
+#include <cuda_runtime.h>
+
 #include "cute/tensor.hpp"
 #include "cute/arch/mma_sm80.hpp"
 #include "utils.cuh"
@@ -218,30 +220,39 @@ __global__ void cuteStyleGemm(double *pA, double *pB, double *pC, int m, int n, 
     copy(tCrC, tCgC);
 }
 
-void refGemm(double *A, double *B, double *C, int m, int n, int k)
-{
-    for (int i = 0; i < m; i++)
-    {
-        for (int j = 0; j < n; j++)
-        {
-            double sum = 0;
-            for (int l = 0; l < k; l++)
-            {
-                // A[i, l] * B[l, j]
-                sum += A[i + l * m] * B[l + j * k];
-            }
-            // C[i, j]
-            C[i + j * m] = sum;
+
+__global__ void checkArrayEquality(double* array1, double* array2, bool* result, int length) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < length) {
+        if (array1[idx] != array2[idx]) {
+            atomicExch((int*)result, int(false));
         }
     }
 }
 
-void assertEqual(double *A, double *B, int size)
-{
-    for (int i = 0; i < size; i++)
-    {
-        assert(A[i] == B[i]);
-    }
+void assertEqual(double* A, double* B, int size) {
+    bool h_result = true;
+    bool* d_result;
+    double *d_A, *d_B;
+
+    cudaMalloc((void**)&d_result, sizeof(bool));
+    cudaMalloc((void**)&d_A, size * sizeof(double));
+    cudaMalloc((void**)&d_B, size * sizeof(double));
+    cudaMemcpy(d_result, &h_result, sizeof(bool), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_A, A, size * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, B, size * sizeof(double), cudaMemcpyHostToDevice);
+
+    int blockSize = 256;
+    int numBlocks = (size + blockSize - 1) / blockSize;
+    checkArrayEquality<<<numBlocks, blockSize>>>(A, B, d_result, size);
+    cudaDeviceSynchronize();
+    cudaMemcpy(&h_result, d_result, sizeof(bool), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_result);
+    cudaFree(d_A);
+    cudaFree(d_B);
+
+    assert(h_result);
 }
 
 void printMatrix(double *A, int m, int n)
@@ -278,7 +289,6 @@ int main(int argc, char const *argv[])
     cudaHostAlloc(reinterpret_cast<void **>(&C_ref), m * n * sizeof(double), cudaHostAllocDefault);
     randn(A, m * k, 0, 10);
     randn(B, k * n, 0, 10);
-    refGemm(A, B, C_ref, m, n, k);
 
     double *dA, *dB, *dC;
     cudaMalloc(reinterpret_cast<void **>(&dA), m * k * sizeof(double));
@@ -299,9 +309,7 @@ int main(int argc, char const *argv[])
         end = clock();
         printf("CUDA error: %s\n", cudaGetErrorString(err));
         printf("Runtime of trivialGemm: %f\n", (double)(end - start) / CLOCKS_PER_SEC);
-        cudaMemcpy(C, dC, m * n * sizeof(double), cudaMemcpyDeviceToHost);
-        assertEqual(C, C_ref, m * n);
-        printf("trivialGemm passed\n");
+        cudaMemcpy(C_ref, dC, m * n * sizeof(double), cudaMemcpyDeviceToHost);
     }
 
     {
