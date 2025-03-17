@@ -1,4 +1,4 @@
-// nvcc -arch=sm_80 -I${CUTLASS_REPO_PATH}/include mma.cu && ./a.out && rm a.out
+// CUTLASS_REPO_PATH=~/cutlass nvcc -arch=sm_80 -I${CUTLASS_REPO_PATH}/include mma.cu && ./a.out && rm a.out
 #include <cstdlib>
 #include <stdio.h>
 #include <iostream>
@@ -7,16 +7,19 @@
 #include "cute/arch/mma_sm80.hpp"
 #include "utils.cuh"
 
-__global__ void trivialGemm(double *A, double *B, double *C, int M, int N, int K) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x; 
-    int j = blockIdx.y * blockDim.y + threadIdx.y; 
+__global__ void trivialGemm(double *A, double *B, double *C, int M, int N, int K)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (i < M && j < N) {
+    if (i < M && j < N)
+    {
         double sum = 0.0f;
-        for (int k = 0; k < K; k++) {
+        for (int k = 0; k < K; k++)
+        {
             sum += A[i + k * M] * B[k + j * K];
         }
-        C[i + j * M] = sum;  // Store result in C
+        C[i + j * M] = sum; // Store result in C
     }
 }
 
@@ -25,7 +28,8 @@ constexpr int BN = 16;
 constexpr int BK = 8;
 
 template <int BM, int BN, int BK>
-__global__ void trivialMMAWithoutCuTe(const double *A, const double *B, double *C, int m, int n, int k) {
+__global__ void trivialMMAWithoutCuTe(const double *A, const double *B, double *C, int m, int n, int k)
+{
     /*
         A, B, C are column-major matrices
         A: (m, k):(1, m)
@@ -51,10 +55,12 @@ __global__ void trivialMMAWithoutCuTe(const double *A, const double *B, double *
 
     double c0_acc, c1_acc;
     c0_acc = c1_acc = 0;
-    for (int blk_k = 0; blk_k < k / BK; blk_k++) {
+    for (int blk_k = 0; blk_k < k / BK; blk_k++)
+    {
         double a0, b0, d0, d1;
-        #pragma unroll
-        for (int warp_k = 0; warp_k < WARP_SLICE_K; warp_k++) {  // each tensor core takes k = 4
+#pragma unroll
+        for (int warp_k = 0; warp_k < WARP_SLICE_K; warp_k++)
+        { // each tensor core takes k = 4
             // from nvidia official guide
             int a_row = lane_id / 4;
             int a_col = lane_id % 4;
@@ -91,13 +97,13 @@ __global__ void trivialMMAWithoutCuTe(const double *A, const double *B, double *
         C + blockIdx.x * BM + warp_i * 8 + c_row + (blockIdx.y * BN + warp_j * 8 + c1_col) * m;
 
     // save result
-    *pC0 = c0_acc; //c0_acc;
-    *pC1 = c1_acc; //c1_acc;
+    *pC0 = c0_acc; // c0_acc;
+    *pC1 = c1_acc; // c1_acc;
 }
 
-
 template <int BM, int BN, int BK>
-__global__ void trivialMMAWithCuTe(const double *pA, const double *pB, double *pC, int m, int n, int k) {
+__global__ void trivialMMAWithCuTe(const double *pA, const double *pB, double *pC, int m, int n, int k)
+{
     /*
         A, B, C are column-major matrices
         A: (m, k):(1, m)
@@ -132,16 +138,18 @@ __global__ void trivialMMAWithCuTe(const double *pA, const double *pB, double *p
 
     double c0_acc, c1_acc;
     c0_acc = c1_acc = 0;
-    for (int blk_k = 0; blk_k < k / BK; blk_k++) {
+    for (int blk_k = 0; blk_k < k / BK; blk_k++)
+    {
         double a0, b0, d0, d1;
         Tensor blkA = gA(make_coord(_, _), blk_k); // ((BM, BK), k / BK) -> (BM, BK)
         Tensor blkB = gB(make_coord(_, _), blk_k);
-        Tensor blkA_sliced_k = zipped_divide(blkA, Shape<_8, _4>{});  // (BM, BK) -> ((8, 4), (WARP_REP_M, WARP_SLICE_K))
-        Tensor blkB_sliced_k = zipped_divide(blkB, Shape<_4, _8>{});  // (BK, BN) -> ((4, 8), (WARP_SLICE_K, WARP_REP_N))
-        #pragma unroll
-        for (int warp_k = 0; warp_k < WARP_SLICE_K; warp_k++) {
+        Tensor blkA_sliced_k = zipped_divide(blkA, Shape<_8, _4>{}); // (BM, BK) -> ((8, 4), (WARP_REP_M, WARP_SLICE_K))
+        Tensor blkB_sliced_k = zipped_divide(blkB, Shape<_4, _8>{}); // (BK, BN) -> ((4, 8), (WARP_SLICE_K, WARP_REP_N))
+#pragma unroll
+        for (int warp_k = 0; warp_k < WARP_SLICE_K; warp_k++)
+        {
             auto ALayout = MMA_Traits<SM80_8x8x4_F64F64F64F64_TN>::ALayout{};
-            Tensor warp_a = blkA_sliced_k(make_coord(_, _), make_coord(warp_i, warp_k));  // ((8, 4), (WARP_REP_M, WARP_SLICE_K)) -> (8, 4)
+            Tensor warp_a = blkA_sliced_k(make_coord(_, _), make_coord(warp_i, warp_k)); // ((8, 4), (WARP_REP_M, WARP_SLICE_K)) -> (8, 4)
             a0 = warp_a(ALayout(lane_id, 0));
 
             // Note: B is (n, k) in CuTe, but (k, n) in this code
@@ -164,11 +172,61 @@ __global__ void trivialMMAWithCuTe(const double *pA, const double *pB, double *p
     warp_c(CLayout(lane_id, 1)) = c1_acc;
 }
 
-void refGemm(double *A, double *B, double *C, int m, int n, int k) {
-    for (int i = 0; i < m; i++) {
-        for (int j = 0; j < n; j++) {
+template <int BM, int BN, int BK, typename TiledMMA>
+__global__ void cuteStyleGemm(double *pA, double *pB, double *pC, int m, int n, int k, TiledMMA tiled_mma)
+{
+    /*
+        A, B, C are column-major matrices
+        A: (m, k):(1, m)
+        B: (k, n):(1, k)
+        C: (m, n):(1, m)
+    */
+    assert(m % BM == 0);
+    assert(n % BN == 0);
+    assert(k % BK == 0);
+    static_assert(BM % 8 == 0);
+    static_assert(BK % 4 == 0);
+    static_assert(BN % 4 == 0);
+
+    using namespace cute;
+    Tensor A = make_tensor(pA, make_shape(m, k), make_stride(1, m));
+    Tensor B = make_tensor(pB, make_shape(n, k), make_stride(k, 1)); // B is (k, n) in CuTe, but (n, k) in this code
+    Tensor C = make_tensor(pC, make_shape(m, n), make_stride(1, m));
+
+    Tensor gA = local_tile(A, Shape<Int<BM>, Int<BK>>{}, make_coord(blockIdx.x, _));          // same as zipped_divide(A, make_shape(BM, BK))(_, make_coord(blockIdx.x, _));
+    Tensor gB = local_tile(B, Shape<Int<BN>, Int<BK>>{}, make_coord(blockIdx.y, _));          // zipped_divide(B, make_shape(BK, BN))(_, make_coord(_, blockIdx.y));
+    Tensor gC = local_tile(C, Shape<Int<BM>, Int<BN>>{}, make_coord(blockIdx.x, blockIdx.y)); // zipped_divide(C, make_shape(BM, BN))(make_coord(_, _), make_coord(blockIdx.x, blockIdx.y));
+
+    auto thr_mma = tiled_mma.get_slice(threadIdx.x);
+
+    auto tAgA = thr_mma.partition_A(gA);
+    auto tBgB = thr_mma.partition_B(gB);
+    auto tCgC = thr_mma.partition_C(gC);
+
+    auto tArA = thr_mma.partition_fragment_A(gA(_, _, 0));
+    auto tBrB = thr_mma.partition_fragment_B(gB(_, _, 0));
+    auto tCrC = thr_mma.partition_fragment_C(gC(_, _));
+
+    clear(tCrC);
+#pragma unroll
+    for (int blk_k = 0; blk_k < k / BK; blk_k++)
+    {
+        copy(tAgA(_, _, _, blk_k), tArA);
+        copy(tBgB(_, _, _, blk_k), tBrB);
+        cute::gemm(tiled_mma, tCrC, tArA, tBrB, tCrC);
+    }
+    copy(tCrC, tCgC);
+}
+
+void refGemm(double *A, double *B, double *C, int m, int n, int k)
+{
+    for (int i = 0; i < m; i++)
+    {
+        for (int j = 0; j < n; j++)
+        {
             double sum = 0;
-            for (int l = 0; l < k; l++) {
+            for (int l = 0; l < k; l++)
+            {
                 // A[i, l] * B[l, j]
                 sum += A[i + l * m] * B[l + j * k];
             }
@@ -178,21 +236,27 @@ void refGemm(double *A, double *B, double *C, int m, int n, int k) {
     }
 }
 
-void assertEqual(double *A, double *B, int size) {
-    for (int i = 0; i < size; i++) {
+void assertEqual(double *A, double *B, int size)
+{
+    for (int i = 0; i < size; i++)
+    {
         assert(A[i] == B[i]);
     }
 }
 
-void printMatrix(double *A, int m, int n) {
-    for (int i = 0; i < m; i++) {
-        for (int j = 0; j < n; j++) {
+void printMatrix(double *A, int m, int n)
+{
+    for (int i = 0; i < m; i++)
+    {
+        for (int j = 0; j < n; j++)
+        {
             // A[i, j]
             std::cout << A[i + j * m] << " ";
         }
         std::cout << std::endl;
     }
-    std::cout << std::endl << std::endl;
+    std::cout << std::endl
+              << std::endl;
 }
 
 int main(int argc, char const *argv[])
@@ -200,25 +264,26 @@ int main(int argc, char const *argv[])
     int m = 2048;
     int n = 2048;
     int k = 2048;
-     // parse args m n k if provided
-    if (argc == 4) {
+    // parse args m n k if provided
+    if (argc == 4)
+    {
         m = std::atoi(argv[1]);
         n = std::atoi(argv[2]);
         k = std::atoi(argv[3]);
     }
     double *A, *B, *C, *C_ref;
-    cudaHostAlloc(reinterpret_cast<void**>(&A), m * k * sizeof(double), cudaHostAllocDefault);
-    cudaHostAlloc(reinterpret_cast<void**>(&B), k * n * sizeof(double), cudaHostAllocDefault);
-    cudaHostAlloc(reinterpret_cast<void**>(&C), m * n * sizeof(double), cudaHostAllocDefault);
-    cudaHostAlloc(reinterpret_cast<void**>(&C_ref), m * n * sizeof(double), cudaHostAllocDefault);
+    cudaHostAlloc(reinterpret_cast<void **>(&A), m * k * sizeof(double), cudaHostAllocDefault);
+    cudaHostAlloc(reinterpret_cast<void **>(&B), k * n * sizeof(double), cudaHostAllocDefault);
+    cudaHostAlloc(reinterpret_cast<void **>(&C), m * n * sizeof(double), cudaHostAllocDefault);
+    cudaHostAlloc(reinterpret_cast<void **>(&C_ref), m * n * sizeof(double), cudaHostAllocDefault);
     randn(A, m * k, 0, 10);
     randn(B, k * n, 0, 10);
     refGemm(A, B, C_ref, m, n, k);
 
     double *dA, *dB, *dC;
-    cudaMalloc(reinterpret_cast<void**>(&dA), m * k * sizeof(double));
-    cudaMalloc(reinterpret_cast<void**>(&dB), k * n * sizeof(double));
-    cudaMalloc(reinterpret_cast<void**>(&dC), m * n * sizeof(double));
+    cudaMalloc(reinterpret_cast<void **>(&dA), m * k * sizeof(double));
+    cudaMalloc(reinterpret_cast<void **>(&dB), k * n * sizeof(double));
+    cudaMalloc(reinterpret_cast<void **>(&dC), m * n * sizeof(double));
     cudaMemcpy(dA, A, m * k * sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpy(dB, B, k * n * sizeof(double), cudaMemcpyHostToDevice);
 
@@ -271,6 +336,25 @@ int main(int argc, char const *argv[])
         cudaMemcpy(C, dC, m * n * sizeof(double), cudaMemcpyDeviceToHost);
         assertEqual(C, C_ref, m * n);
         printf("trivialMMAWithCuTe passed\n");
+    }
+
+    {
+        // test cuteStyleGemm
+        using namespace cute;
+        randn(C, m * n, 0, 100);
+        auto tiled_mma = cute::make_tiled_mma(SM80_8x8x4_F64F64F64F64_TN{}, make_layout(Shape<Int<BM / 8>, Int<BN / 8>>{}));
+        dim3 threads(size(tiled_mma));
+        dim3 blocks(m / BM, n / BN);
+        time_t start, end;
+        start = clock();
+        cuteStyleGemm<BM, BN, BK><<<blocks, threads>>>(dA, dB, dC, m, n, k, tiled_mma);
+        cudaError_t err = cudaDeviceSynchronize();
+        end = clock();
+        printf("CUDA error: %s\n", cudaGetErrorString(err));
+        printf("Runtime of cuteStyleGemm: %f\n", (double)(end - start) / CLOCKS_PER_SEC);
+        cudaMemcpy(C, dC, m * n * sizeof(double), cudaMemcpyDeviceToHost);
+        assertEqual(C, C_ref, m * n);
+        printf("cuteStyleGemm passed\n");
     }
 
     cudaFree(dA);
