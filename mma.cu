@@ -224,7 +224,7 @@ __global__ void cuteStyleGemm(double *pA, double *pB, double *pC, int m, int n, 
 __global__ void checkArrayEquality(double* array1, double* array2, bool* result, int length) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < length) {
-        if (array1[idx] != array2[idx]) {
+        if (array1[idx] != array2[idx] && (*result)) {
             atomicExch((int*)result, int(false));
         }
     }
